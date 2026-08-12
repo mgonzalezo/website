@@ -139,6 +139,99 @@ spec:
 
 KServe uses direct PVC volume mounting, where the PVC volume is directly mounted to `/mnt/models` in the user container rather than creating a symlink from `/mnt/models` to a shared volume. This approach improves performance and simplifies the storage architecture.
 
+## Loading model weights using a Kubernetes Job
+
+A common pattern for large models is to populate a PVC with a Kubernetes `Job` before or after deploying the `InferenceService`. This section covers two failure modes that are not obvious from the Kubernetes or KServe documentation.
+
+### RWO PVC race condition
+
+When you create an `InferenceService` that references an empty or partially-populated **ReadWriteOnce (RWO)** PVC, the predictor pod starts immediately and claims **exclusive** access to that PVC. Any model-loader `Job` or init container scheduled concurrently will fail to attach the volume:
+
+```
+Multi-Attach error for volume "pvc-<uuid>": Volume is already used by pod(s) sklearn-pvc-predictor-<hash>
+```
+
+This failure is silent from the `InferenceService` perspective — the predictor pod starts, but the loader never writes the weights, so the model server fails with a missing-model error rather than a volume error.
+
+**Workaround: scale the predictor to zero before loading**
+
+Scale the predictor down before running the loader Job, then scale it back up once the weights are in place:
+
+```bash
+# 1. Create the InferenceService with zero replicas so the predictor does not claim the PVC
+kubectl patch inferenceservice sklearn-pvc \
+  --type='merge' \
+  -p '{"spec":{"predictor":{"minReplicas":0,"maxReplicas":0}}}'
+
+# 2. Run your loader Job to populate the PVC
+kubectl apply -f model-loader-job.yaml
+kubectl wait --for=condition=complete job/model-loader --timeout=600s
+
+# 3. Restore replicas so the predictor can start and attach the now-populated PVC
+kubectl patch inferenceservice sklearn-pvc \
+  --type='merge' \
+  -p '{"spec":{"predictor":{"minReplicas":1,"maxReplicas":1}}}'
+```
+
+Alternatively, create the `InferenceService` **after** the loader Job has completed and the loader pod has been deleted, so the RWO PVC is free when the predictor starts.
+
+:::tip
+If you are using a **ReadWriteMany (RWX)** PVC (e.g., NFS, CephFS, or a cloud-provider ReadWriteMany storage class), multiple pods can attach simultaneously and the race condition does not apply.
+:::
+
+### PVC permissions for loader pods (fsGroup)
+
+When KServe creates a predictor pod it sets a **namespace-derived `fsGroup`** on the volume mount (for example `1000840000` on OpenShift). Files written to the PVC by the predictor are owned by that group.
+
+If a loader `Job` mounts the same PVC **without the matching `fsGroup`**, it receives a `Permission denied` error when writing model weights — even with the correct `serviceAccount` and RBAC.
+
+Set `securityContext.fsGroup` on your loader `Job` pod spec to match the namespace's UID/GID range:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-loader
+spec:
+  template:
+    spec:
+      # highlight-start
+      securityContext:
+        fsGroup: 1000840000   # match the namespace-derived fsGroup used by KServe
+      # highlight-end
+      volumes:
+        - name: model-store
+          persistentVolumeClaim:
+            claimName: task-pv-claim
+      containers:
+        - name: loader
+          image: python:3.11-slim
+          command: ["python", "download_model.py"]
+          volumeMounts:
+            - mountPath: "/mnt/models"
+              name: model-store
+      restartPolicy: Never
+```
+
+To find the correct `fsGroup` for your namespace:
+
+```bash
+# OpenShift / OCP — read the namespace supplemental-groups annotation
+kubectl get namespace <your-namespace> \
+  -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}'
+# Example output: 1000840000/10000  →  use 1000840000
+
+# Vanilla Kubernetes with PodSecurity admission
+kubectl get namespace <your-namespace> \
+  -o jsonpath='{.metadata.annotations.kubernetes\.io/uid-range}'
+```
+
+Use the **first value** of the range as the `fsGroup`.
+
+:::note
+This requirement applies to any external pod — loader Jobs, init containers, or debugging pods — that mounts a PVC previously attached to a KServe `InferenceService` predictor. The KServe predictor itself sets the correct `fsGroup` automatically.
+:::
+
 ## Run a prediction
 
 Now, the ingress can be accessed at `${INGRESS_HOST}:${INGRESS_PORT}` or follow [this instruction](../../../getting-started/predictive-first-isvc.md#4-determine-the-ingress-ip-and-ports)
